@@ -47,8 +47,22 @@ Workflows stream every prompt node; follow specific conversation lanes with
 ```tsx
 import { usePromptJugglerStream } from '@promptjuggler/browser/react';
 
-const { connected, runs } = usePromptJugglerStream({ getToken });
-// runs[runId] = { text, status: 'streaming' | 'done' | 'failed', error? }
+const { connected, runs } = usePromptJugglerStream({ getToken }, [threadId]);
+// runs[runId] = { text, status: 'streaming' | 'done' | 'failed', gapped?, error? }
+```
+
+## Angular (17+)
+
+```ts
+import { injectPromptJugglerStream } from '@promptjuggler/browser/angular';
+
+// Signals read during the factory call drive resubscription — hoist them into
+// locals (a read deferred into getToken happens too late to be tracked).
+readonly stream = injectPromptJugglerStream(() => {
+  const thread = this.threadId();
+  return { getToken: () => this.mintToken(thread) };
+});
+// stream.connected: Signal<boolean>; stream.runs: Signal<Record<string, RunState>>
 ```
 
 ## Reconnection
