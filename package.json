@@ -1,6 +1,6 @@
 {
   "name": "@promptjuggler/browser",
-  "version": "0.0.0",
+  "version": "0.2.0",
   "description": "Browser SDK for PromptJuggler — subscribe to live token streams with a thread-scoped credential. Everything here is safe to ship to an end user's browser.",
   "license": "MIT",
   "type": "module",
