@@ -10,8 +10,10 @@ this package is safe to ship to an end user — it never sees your API key.
    response to your frontend. The credential grants read access to one thread
    and nothing else.
 2. Your **frontend** hands that response to this SDK and renders events.
-3. Connect **before** triggering runs: the stream has no replay — anything
-   missed is recovered by fetching the run when its `done` event arrives.
+3. Connect **before** triggering runs: a fresh subscription starts at the
+   live tip. Reconnects resume exactly where they left off; when the server
+   cannot resume without loss it says `stale`, and terminal events carry a
+   `gapped` flag — `true` means fetch the run for the authoritative result.
 
 ```ts
 import { PromptJugglerStream } from '@promptjuggler/browser';
@@ -25,14 +27,17 @@ const stream = new PromptJugglerStream({
 });
 
 stream.on('text', ({ runId, text }) => render(runId, text)); // full text, maintained for you
-stream.on('done', ({ runId }) => refetch(runId)); // authoritative result via the API
+stream.on('done', ({ runId, gapped }) => gapped && refetch(runId)); // fetch only when told to
 stream.on('failure', ({ runId, code, message }) => showError(runId, message));
 stream.connect();
 ```
 
-`token` (raw deltas), `reset`, `connected` and `disconnected` events are also
-emitted for append-style UIs — segment-scoped reset handling is already applied
-to the `text` view, so most apps never need them.
+`token` (raw deltas), `reset`, `gap`, `stale`, `connected` and `disconnected`
+events are also emitted for append-style UIs — segment handling, resets, and
+resume are already applied to the `text` view, so most apps never need them.
+One edge to know: `gap` can fire even after a clean `done` (a late token
+proving the finished text incomplete) — treat it as a refetch cue for runs
+you have already settled. The React hook handles this for you.
 
 Workflows stream every prompt node; follow specific conversation lanes with
 `channels: ['support']` (the channel each node declares in the workflow editor).
