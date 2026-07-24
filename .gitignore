@@ -1,0 +1,6 @@
+/node_modules/
+/dist/
+*.tsbuildinfo
+.eslintcache
+# Library, not an app — resolve latest-matching deps each install (mirrors the PHP SDK).
+pnpm-lock.yaml

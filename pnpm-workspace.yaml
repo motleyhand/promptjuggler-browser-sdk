@@ -1,0 +1,4 @@
+# esbuild ships a platform-specific native binary via a postinstall script; pnpm 11
+# blocks build scripts unless allow-listed here. vitest needs it.
+allowBuilds:
+  esbuild: true
