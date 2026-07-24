@@ -1,0 +1,46 @@
+name: Publish to npm
+
+# Runs in the public mirror — which is exactly where npm wants the publisher:
+# trusted publishing requires the publishing repository to match package.json's
+# repository.url, so publishing from here keeps the npmjs.com Repository link
+# and README pointing at this public repo, and provenance attestation works
+# (it needs a public source repo). The monorepo splits the code and pushes the
+# release tag here; that tag push triggers this workflow.
+#
+# Bootstrap: the very first publish of a new package needs an NPM_TOKEN secret
+# in THIS repo (a trusted publisher can only be configured on a package that
+# already exists). After that release, configure the Trusted Publisher on
+# npmjs.com — GitHub Actions, this repository, publish.yaml — and delete the
+# token; npm prefers OIDC whenever a trusted publisher matches.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write # npm trusted publishing (OIDC)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: build and publish
+        env:
+          # Bootstrap fallback only — see the header. Absent, npm uses OIDC.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm install -g pnpm npm@latest # scripts run pnpm; OIDC needs npm >= 11.5.1
+          version="${GITHUB_REF_NAME#v}"
+          npm version "$version" --no-git-tag-version --allow-same-version
+          pnpm install --no-frozen-lockfile
+          pnpm build
+          npm publish --access public
