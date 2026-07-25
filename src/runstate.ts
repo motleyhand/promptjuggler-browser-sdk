@@ -1,10 +1,12 @@
-import type { DoneEvent, FailureEvent, GapEvent, TextEvent } from './stream';
+import type { DataEvent, DataItem, DoneEvent, FailureEvent, GapEvent, TextEvent } from './stream';
 
 /** One run's live view: the streamed text so far and where it stands. */
 export interface RunState {
   text: string;
   channel: string;
   status: 'streaming' | 'done' | 'failed';
+  /** Emit-tool payloads this run produced, if any — structured data beside the text. */
+  data?: DataItem[];
   /** Events were (or may have been) lost: fetch the run for the full result. */
   gapped?: boolean;
   error?: { code: string; message: string };
@@ -28,7 +30,20 @@ export function applyText(runs: RunStates, { runId, channel, text, gapped }: Tex
     return runs;
   }
 
-  return { ...runs, [runId]: { text, channel, status: 'streaming', gapped } };
+  // Carry `data` across: a text delta and an emit payload are independent
+  // channels of the same run, each maintained by its own event.
+  return { ...runs, [runId]: { text, channel, status: 'streaming', gapped, data: runs[runId]?.data } };
+}
+
+/** The run's maintained emit payloads changed; text and status are untouched. */
+export function applyData(runs: RunStates, { runId, channel, data }: DataEvent): RunStates {
+  if (settled(runs[runId])) {
+    return runs;
+  }
+
+  const previous = runs[runId] ?? { text: '', channel, status: 'streaming' as const };
+
+  return { ...runs, [runId]: { ...previous, data } };
 }
 
 export function applyDone(runs: RunStates, { runId, channel, gapped }: DoneEvent): RunStates {
@@ -40,7 +55,7 @@ export function applyDone(runs: RunStates, { runId, channel, gapped }: DoneEvent
   // the stream knows whether the tail may have been lost.
   return {
     ...runs,
-    [runId]: { text: runs[runId]?.text ?? '', channel, status: 'done', gapped },
+    [runId]: { text: runs[runId]?.text ?? '', channel, status: 'done', gapped, data: runs[runId]?.data },
   };
 }
 
@@ -59,6 +74,7 @@ export function applyFailure(
       channel,
       status: 'failed',
       gapped,
+      data: runs[runId]?.data,
       error: { code, message },
     },
   };
@@ -87,15 +103,22 @@ export function applyGap(runs: RunStates, { runId, channel }: GapEvent): RunStat
  * Their events rebuild them if retained; settled runs are already true.
  */
 export function applyStale(runs: RunStates): RunStates {
-  const flagged = Object.entries(runs).filter(([, run]) => run.status === 'streaming' && !run.gapped);
-  if (flagged.length === 0) {
+  // A streaming run needs amending if it isn't already flagged, or still holds
+  // emit payloads the wiped stream can no longer vouch for. Text self-heals on
+  // replay — every token re-publishes it — but data only moves on a data frame,
+  // so a rebuild that drops the emit would otherwise settle with stale cards.
+  // Clear it here and let a fresh frame restore any that still apply.
+  const affected = Object.values(runs).some(
+    (run) => run.status === 'streaming' && (!run.gapped || run.data !== undefined),
+  );
+  if (!affected) {
     return runs;
   }
 
   return Object.fromEntries(
     Object.entries(runs).map(([runId, run]) => [
       runId,
-      run.status === 'streaming' ? { ...run, gapped: true } : run,
+      run.status === 'streaming' ? { ...run, gapped: true, data: undefined } : run,
     ]),
   );
 }

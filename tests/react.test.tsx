@@ -223,6 +223,36 @@ describe('usePromptJugglerStream', () => {
     unmount();
   });
 
+  test('exposes emit payloads on runs[id].data alongside the text', async () => {
+    const { result, unmount } = renderHook(() =>
+      usePromptJugglerStream({
+        getToken: () => Promise.resolve({ token: 'test-token', url }),
+        reconnectDelayMs: { min: 10, max: 50 },
+      }),
+    );
+
+    const connection = await server.connection(1);
+    act(() => {
+      connection.send(
+        'token',
+        '{"kind":"token","runId":"r1","channel":"default","segment":0,"seq":1,"text":"Here they are"}',
+      );
+      connection.send(
+        'data',
+        '{"kind":"data","runId":"r1","channel":"default","segment":0,"seq":2,"tool":"present_candidates","payload":{"candidateIds":[333,412]}}',
+      );
+    });
+
+    await waitFor(() => {
+      expect(result.current.runs.r1).toMatchObject({
+        text: 'Here they are',
+        data: [{ tool: 'present_candidates', payload: { candidateIds: [333, 412] } }],
+      });
+    });
+
+    unmount();
+  });
+
   test('marks failed runs with the error', async () => {
     const { result, unmount } = renderHook(() =>
       usePromptJugglerStream({

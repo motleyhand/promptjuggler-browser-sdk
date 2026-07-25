@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { applyDone, applyFailure, applyGap, applyStale, applyText } from './runstate';
+import { applyData, applyDone, applyFailure, applyGap, applyStale, applyText } from './runstate';
 import type { RunState, RunStates } from './runstate';
 import { PromptJugglerStream, type PromptJugglerStreamOptions } from './stream';
 
@@ -53,6 +53,9 @@ export function usePromptJugglerStream(
       }),
       stream.on('text', (event) => {
         setRuns((previous) => applyText(previous, event));
+      }),
+      stream.on('data', (event) => {
+        setRuns((previous) => applyData(previous, event));
       }),
       stream.on('stale', () => {
         setRuns(applyStale);

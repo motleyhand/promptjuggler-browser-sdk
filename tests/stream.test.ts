@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
-import type { DoneEvent, TextEvent } from '../src/stream';
+import type { DataEvent, DoneEvent, TextEvent } from '../src/stream';
 import { PromptJugglerStream, withChannels } from '../src/stream';
 import { connect, record, SseServer } from './helpers';
 
@@ -429,6 +429,95 @@ describe('PromptJugglerStream', () => {
     connection.send('done', '{"kind":"done","runId":"r1","channel":"default"}');
     expect(await done.next()).toMatchObject({ runId: 'r1', gapped: true });
     expect(gaps.events).toHaveLength(1);
+  });
+
+  test("data events maintain the run's emit payload list", async () => {
+    stream = connect(url);
+    const datas = record<DataEvent>();
+    stream.on('data', datas.push);
+    stream.connect();
+
+    const connection = await server.connection(1);
+    connection.send(
+      'data',
+      '{"kind":"data","runId":"r1","channel":"default","segment":0,"seq":1,"tool":"cards","payload":{"ids":[333]}}',
+    );
+    expect(await datas.next()).toMatchObject({
+      runId: 'r1',
+      data: [{ tool: 'cards', payload: { ids: [333] } }],
+    });
+
+    connection.send(
+      'data',
+      '{"kind":"data","runId":"r1","channel":"default","segment":0,"seq":2,"tool":"cards","payload":{"ids":[412]}}',
+    );
+    // The event carries the full maintained list, not just the new item.
+    expect(await datas.next()).toMatchObject({
+      data: [{ payload: { ids: [333] } }, { payload: { ids: [412] } }],
+    });
+  });
+
+  test('a data frame between tokens does not false-gap the continuation', async () => {
+    stream = connect(url);
+    const texts = record<TextEvent>();
+    const datas = record<DataEvent>();
+    const gaps = record<{ runId: string }>();
+    stream.on('text', texts.push);
+    stream.on('data', datas.push);
+    stream.on('gap', gaps.push);
+    stream.connect();
+
+    const connection = await server.connection(1);
+    // The runner numbers the data frame in the same segment sequence as the
+    // surrounding tokens: reset 0, token 1, data 2, continuation token 3.
+    connection.send('reset', '{"kind":"reset","runId":"r1","channel":"default","segment":0,"seq":0}');
+    connection.send(
+      'token',
+      '{"kind":"token","runId":"r1","channel":"default","segment":0,"seq":1,"text":"Pulling those up"}',
+    );
+    connection.send(
+      'data',
+      '{"kind":"data","runId":"r1","channel":"default","segment":0,"seq":2,"tool":"cards","payload":{"ids":[9]}}',
+    );
+    connection.send(
+      'token',
+      '{"kind":"token","runId":"r1","channel":"default","segment":0,"seq":3,"text":" — done."}',
+    );
+
+    expect((await texts.next()).text).toBe('Pulling those up');
+    // Seq 3 lands straight after the data frame's seq 2: contiguous, so the
+    // text keeps growing instead of freezing at a phantom gap.
+    expect(await texts.next()).toMatchObject({ text: 'Pulling those up — done.', gapped: false });
+    expect(await datas.next()).toMatchObject({ data: [{ tool: 'cards', payload: { ids: [9] } }] });
+    expect(gaps.events).toHaveLength(0);
+  });
+
+  test('a data straggler after done is dropped and flags the run', async () => {
+    stream = connect(url);
+    const datas = record<DataEvent>();
+    const gaps = record<{ runId: string }>();
+    const done = record<DoneEvent>();
+    stream.on('data', datas.push);
+    stream.on('gap', gaps.push);
+    stream.on('done', done.push);
+    stream.connect();
+
+    const connection = await server.connection(1);
+    // A clean run first — a token so its verdict settles un-gapped.
+    connection.send(
+      'token',
+      '{"kind":"token","runId":"r1","channel":"default","segment":0,"seq":1,"text":"Hi"}',
+    );
+    connection.send('done', '{"kind":"done","runId":"r1","channel":"default"}');
+    expect(await done.next()).toMatchObject({ runId: 'r1', gapped: false });
+
+    connection.send(
+      'data',
+      '{"kind":"data","runId":"r1","channel":"default","segment":0,"seq":2,"tool":"cards","payload":{}}',
+    );
+    // A late emit proves the settled data was incomplete: flagged, not applied.
+    expect(await gaps.next()).toMatchObject({ runId: 'r1' });
+    expect(datas.events).toHaveLength(0);
   });
 
   test('terminal events drop the run buffer', async () => {

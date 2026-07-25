@@ -1,5 +1,7 @@
 export { PromptJugglerStream } from './stream';
 export type {
+  DataEvent,
+  DataItem,
   DoneEvent,
   FailureEvent,
   GapEvent,

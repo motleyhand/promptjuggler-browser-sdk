@@ -1,5 +1,7 @@
-import { RunBuffer } from './buffer';
+import { RunBuffer, type DataItem } from './buffer';
 import { SseParser } from './sse';
+
+export type { DataItem } from './buffer';
 
 /** What `getToken` resolves to — hand back `createStreamToken`'s response verbatim. */
 export interface StreamTokenGrant {
@@ -66,6 +68,18 @@ export interface ResetEvent {
   segment: number;
 }
 
+/**
+ * The run's emit-tool payloads so far — structured data the model produced
+ * beside its prose. Maintained like `text`: each event carries the full list,
+ * with retried segments dropped. `payload` is whatever the tool's schema
+ * describes; cast it at the use site.
+ */
+export interface DataEvent {
+  runId: string;
+  channel: string;
+  data: DataItem[];
+}
+
 export interface DoneEvent {
   runId: string;
   channel: string;
@@ -89,6 +103,8 @@ export interface StreamEvents {
   text: TextEvent;
   /** A segment is being re-generated; the SDK has already discarded its buffer. */
   reset: ResetEvent;
+  /** The run's emit-tool payloads, maintained — subscribe to render structured data. */
+  data: DataEvent;
   /**
    * One run's text is incomplete; frozen at a true prefix. May also follow a
    * terminal event, when a straggling token proves the verdict it carried was
@@ -119,6 +135,8 @@ interface WireEvent {
   text?: string;
   code?: string;
   message?: string;
+  tool?: string;
+  payload?: unknown;
 }
 
 type Listener<E extends keyof StreamEvents> = (event: StreamEvents[E]) => void;
@@ -339,7 +357,7 @@ export class PromptJugglerStream {
     if (runId === undefined) {
       return;
     }
-    if ((kind === 'token' || kind === 'reset') && this.verdicts.has(runId)) {
+    if ((kind === 'token' || kind === 'reset' || kind === 'data') && this.verdicts.has(runId)) {
       // The runner's tokens ride a lagging async publisher while the backend
       // publishes the terminal frame directly, so stragglers can trail done.
       // The run stays terminal — no buffer revival, no status flip — but a
@@ -376,6 +394,7 @@ export class PromptJugglerStream {
       case 'reset': {
         const segment = wire.segment ?? 0;
         const buffer = this.buffer(runId);
+        const dataBefore = buffer.data().length;
         const { changed, orphaned } = buffer.reset(segment, wire.seq ?? 0);
         this.emit('reset', { runId, channel, segment });
         if (orphaned) {
@@ -386,6 +405,29 @@ export class PromptJugglerStream {
         }
         if (changed) {
           this.emit('text', { runId, channel, text: buffer.text(), gapped: buffer.gapped() });
+        }
+        if (buffer.data().length !== dataBefore) {
+          // The reset discarded payloads from the re-generated segment; the
+          // retry re-emits them, so publish the shorter maintained list now.
+          this.emit('data', { runId, channel, data: buffer.data() });
+        }
+        break;
+      }
+      case 'data': {
+        const segment = wire.segment ?? 0;
+        const seq = wire.seq ?? 0;
+        const buffer = this.buffer(runId);
+        const before = buffer.data().length;
+        const outcome = buffer.addData(segment, seq, { tool: wire.tool ?? '', payload: wire.payload });
+        if (outcome === 'gap') {
+          // A data frame rides the token sequence, so a hole here means a token
+          // was lost before it: flag the run and let text subscribers see the
+          // now-frozen prefix, exactly as a token gap would.
+          this.emit('gap', { runId, channel, segment });
+          this.emit('text', { runId, channel, text: buffer.text(), gapped: buffer.gapped() });
+        }
+        if (buffer.data().length !== before) {
+          this.emit('data', { runId, channel, data: buffer.data() });
         }
         break;
       }

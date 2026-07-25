@@ -1,3 +1,9 @@
+/** One emit-tool payload the run produced, exactly as the model sent it. */
+export interface DataItem {
+  tool: string;
+  payload: unknown;
+}
+
 /**
  * Per-run text assembly with the protocol's segment semantics.
  *
@@ -13,7 +19,8 @@
  * loss signal, handled by the stream, not here. What remains here is honesty
  * at the edges of a subscription:
  *
- * `seq` numbers the events of one attempt, reset first (seq 0), tokens from 1.
+ * `seq` numbers the events of one attempt — reset first (seq 0), then tokens
+ * and emit-data frames interleaved from 1.
  * A run first seen mid-history — after a `stale` rebuild, or a late join —
  * carries its own truncation: a first token above seq 1 means the segment's
  * head was never delivered, and a first sight at a nonzero segment means
@@ -27,39 +34,62 @@
  */
 export class RunBuffer {
   private readonly segments = new Map<number, Segment>();
+  // Emit payloads keyed by the segment that produced them, so a reset drops
+  // them alongside that segment's text — a retry re-emits, and stale wipes all.
+  private readonly dataBySegment = new Map<number, DataItem[]>();
 
   /** Feed a token delta to its segment; the result says what became of it. */
   append(segment: number, seq: number, text: string): 'appended' | 'gap' | 'dropped' {
+    const { outcome, target } = this.advance(segment, seq);
+    if (target) {
+      target.text += text;
+    }
+
+    return outcome;
+  }
+
+  /**
+   * Advance a segment's sequence by one event, applying the contiguity rules a
+   * token and a data frame share — both ride the same per-segment seq, reset
+   * first (seq 0), events from 1. Returns the event's fate, for the caller's
+   * gap/text signalling, and the segment to apply the payload to — or undefined
+   * when the event fell outside a live, in-order slot and its payload must be
+   * withheld so the maintained view stays a true prefix.
+   */
+  private advance(
+    segment: number,
+    seq: number,
+  ): { outcome: 'appended' | 'gap' | 'dropped'; target: Segment | undefined } {
     const orphaned = this.ensureHead(segment);
     const existing = this.segments.get(segment);
     if (!existing) {
       // First sight of this segment. Its attempt opened with a reset at seq 0,
-      // so a token at seq 1 means we missed only that reset — harmless, since a
-      // reset on a never-buffered segment has nothing to wipe. Anything later
-      // and the segment's head is already lost.
+      // so a first event at seq 1 means we missed only that reset — harmless,
+      // since a reset on a never-buffered segment has nothing to wipe. Anything
+      // later and the segment's head is already lost.
       if (seq === 1) {
-        this.segments.set(segment, { text, lastSeq: seq, gapped: false });
+        const fresh: Segment = { text: '', lastSeq: seq, gapped: false };
+        this.segments.set(segment, fresh);
 
         // The segment itself is whole, but a phantom head just flagged the
         // run: that loss surfaces as a gap, not as a clean-looking append.
-        return orphaned ? 'gap' : 'appended';
+        return { outcome: orphaned ? 'gap' : 'appended', target: fresh };
       }
       this.segments.set(segment, { text: '', lastSeq: seq, gapped: true });
 
-      return 'gap';
+      return { outcome: 'gap', target: undefined };
     }
     if (existing.gapped) {
-      return 'dropped';
+      return { outcome: 'dropped', target: undefined };
     }
     if (seq !== existing.lastSeq + 1) {
       existing.gapped = true;
 
-      return 'gap';
+      return { outcome: 'gap', target: undefined };
     }
-    existing.text += text;
     existing.lastSeq = seq;
 
-    return 'appended';
+    return { outcome: 'appended', target: existing };
   }
 
   /**
@@ -79,7 +109,50 @@ export class RunBuffer {
     }
     this.segments.set(segment, { text: '', lastSeq: seq, gapped: false });
 
+    for (const s of this.dataBySegment.keys()) {
+      if (s >= segment) {
+        this.dataBySegment.delete(s);
+      }
+    }
+
     return { changed, orphaned };
+  }
+
+  /**
+   * Record an emit payload against the segment that produced it. A data frame
+   * rides the same per-segment seq as tokens, so this advances the segment's
+   * sequence exactly as a token would: an in-order payload is kept, and a hole
+   * — a token lost just before this frame — freezes the segment rather than let
+   * the following token read as contiguous. Returns the frame's fate so the
+   * caller can signal a gap the same way it does for a token.
+   */
+  addData(segment: number, seq: number, item: DataItem): 'appended' | 'gap' | 'dropped' {
+    const { outcome, target } = this.advance(segment, seq);
+    if (target) {
+      const list = this.dataBySegment.get(segment);
+      if (list) {
+        list.push(item);
+      } else {
+        this.dataBySegment.set(segment, [item]);
+      }
+    }
+
+    return outcome;
+  }
+
+  /**
+   * The run's emit payloads so far, in emission order (by segment, then
+   * arrival) — and, like {@link text}, a true prefix: segments beyond the first
+   * gap are withheld, because any emit calls before that unresolved hole are
+   * unknown and the list would otherwise present a suffix as the whole.
+   */
+  data(): DataItem[] {
+    const frontier = this.frontier();
+
+    return [...this.dataBySegment.entries()]
+      .filter(([segment]) => segment <= frontier)
+      .sort(([a], [b]) => a - b)
+      .flatMap(([, items]) => items);
   }
 
   /**
@@ -98,15 +171,31 @@ export class RunBuffer {
   }
 
   /**
+   * The highest segment whose content is still provable — the first gapped
+   * segment (inclusive), or Infinity when nothing is gapped. Segments past it
+   * sit on the far side of a hole, so both text and data withhold them.
+   */
+  private frontier(): number {
+    const gapped = [...this.segments.entries()]
+      .filter(([, state]) => state.gapped)
+      .map(([segment]) => segment);
+
+    return gapped.length === 0 ? Infinity : Math.min(...gapped);
+  }
+
+  /**
    * The run's text so far — always a true prefix of the run. Segments join in
    * order up to and including the first gapped one, which contributes its
    * frozen prefix; anything above it would sit on the far side of a hole.
    */
   text(): string {
-    const ordered = [...this.segments.entries()].sort(([a], [b]) => a - b).map(([, state]) => state);
-    const holed = ordered.findIndex((state) => state.gapped);
+    const frontier = this.frontier();
 
-    return (holed === -1 ? ordered : ordered.slice(0, holed + 1)).map((state) => state.text).join('');
+    return [...this.segments.entries()]
+      .filter(([segment]) => segment <= frontier)
+      .sort(([a], [b]) => a - b)
+      .map(([, state]) => state.text)
+      .join('');
   }
 
   /** Whether any segment lost events — `text()` is then an incomplete prefix. */

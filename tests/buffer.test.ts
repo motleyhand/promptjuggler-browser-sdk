@@ -109,6 +109,77 @@ describe('RunBuffer', () => {
     expect(buffer.gapped()).toBe(true);
   });
 
+  test('data payloads accumulate in segment then arrival order', () => {
+    const buffer = new RunBuffer();
+    buffer.reset(0, 0); // the run opens on segment 0
+    // A later continuation emits before segment 0's own payloads: the sort
+    // still orders by segment, then by arrival within a segment.
+    buffer.addData(3, 1, { tool: 'chart', payload: { n: 2 } });
+    buffer.addData(0, 1, { tool: 'cards', payload: { ids: [1] } });
+    buffer.addData(0, 2, { tool: 'cards', payload: { ids: [2] } });
+
+    expect(buffer.data()).toEqual([
+      { tool: 'cards', payload: { ids: [1] } },
+      { tool: 'cards', payload: { ids: [2] } },
+      { tool: 'chart', payload: { n: 2 } },
+    ]);
+  });
+
+  test('a reset discards data for the re-generated segment and above', () => {
+    const buffer = new RunBuffer();
+    buffer.reset(0, 0);
+    buffer.addData(0, 1, { tool: 'cards', payload: 'kept' });
+    buffer.reset(3, 0);
+    buffer.addData(3, 1, { tool: 'cards', payload: 'dropped' });
+
+    buffer.reset(3, 0); // segment 3 re-generates
+    expect(buffer.data()).toEqual([{ tool: 'cards', payload: 'kept' }]);
+  });
+
+  test('a data frame between tokens advances the seq so the next token is not a false gap', () => {
+    // The runner numbers a data event in the same per-segment seq as tokens
+    // (reset 0, token 1, data 2, continuation token 3). The data frame must
+    // consume its slot, or the token at seq 3 reads as a skip from 1.
+    const buffer = new RunBuffer();
+    buffer.reset(0, 0);
+    expect(buffer.append(0, 1, 'Pulling those up')).toBe('appended');
+    expect(buffer.addData(0, 2, { tool: 'cards', payload: { ids: [7] } })).toBe('appended');
+    expect(buffer.append(0, 3, ' — here.')).toBe('appended');
+    expect(buffer.text()).toBe('Pulling those up — here.');
+    expect(buffer.gapped()).toBe(false);
+    expect(buffer.data()).toEqual([{ tool: 'cards', payload: { ids: [7] } }]);
+  });
+
+  test('a data frame detects a token lost just before it', () => {
+    // The mirror case: a hole in front of a data frame must freeze the segment,
+    // not slip through unnoticed because data ignored the sequence.
+    const buffer = new RunBuffer();
+    buffer.reset(0, 0);
+    buffer.append(0, 1, 'Pulling');
+    // seq 2 (a token) never arrived; the data frame comes at seq 3.
+    expect(buffer.addData(0, 3, { tool: 'cards', payload: {} })).toBe('gap');
+    expect(buffer.gapped()).toBe(true);
+    // The payload sits across a hole, so it is withheld from the maintained list.
+    expect(buffer.data()).toEqual([]);
+  });
+
+  test('data up to the first gap is kept; beyond it is withheld like text', () => {
+    // A hole in segment 0, then a continuation in segment 3 that emits. Emits
+    // between the hole and the continuation are unknown, so segment 3's payload
+    // must not present as the full list — mirror what text() withholds.
+    const buffer = new RunBuffer();
+    buffer.reset(0, 0);
+    buffer.append(0, 1, 'Let me chec');
+    buffer.addData(0, 2, { tool: 'cards', payload: { ids: [1] } }); // before the hole — kept
+    buffer.append(0, 4, 'k'); // seq 3 lost — segment 0 is gapped
+    buffer.reset(3, 0);
+    buffer.addData(3, 1, { tool: 'cards', payload: { ids: [5] } }); // beyond the hole — withheld
+
+    expect(buffer.gapped()).toBe(true);
+    expect(buffer.text()).toBe('Let me chec');
+    expect(buffer.data()).toEqual([{ tool: 'cards', payload: { ids: [1] } }]);
+  });
+
   test('a regressing sequence freezes the segment rather than fabricate a splice', () => {
     // Cannot happen on an ordered, replayed log — a retry's reset always
     // precedes its tokens. If it happens anyway, freezing is the honest move.

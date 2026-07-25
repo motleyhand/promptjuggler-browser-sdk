@@ -27,10 +27,16 @@ const stream = new PromptJugglerStream({
 });
 
 stream.on('text', ({ runId, text }) => render(runId, text)); // full text, maintained for you
+stream.on('data', ({ runId, data }) => renderCards(runId, data)); // emit-tool payloads, maintained
 stream.on('done', ({ runId, gapped }) => gapped && refetch(runId)); // fetch only when told to
 stream.on('failure', ({ runId, code, message }) => showError(runId, message));
 stream.connect();
 ```
+
+An **emit tool** lets a prompt return structured data beside its prose (e.g. a
+list of ids to render as cards). The `data` event carries the run's maintained
+list of `{ tool, payload }` — cast `payload` to whatever the tool's schema
+describes. Render it next to `text` and you have prose-plus-cards.
 
 `token` (raw deltas), `reset`, `gap`, `stale`, `connected` and `disconnected`
 events are also emitted for append-style UIs — segment handling, resets, and
@@ -48,7 +54,7 @@ Workflows stream every prompt node; follow specific conversation lanes with
 import { usePromptJugglerStream } from '@promptjuggler/browser/react';
 
 const { connected, runs } = usePromptJugglerStream({ getToken }, [threadId]);
-// runs[runId] = { text, status: 'streaming' | 'done' | 'failed', gapped?, error? }
+// runs[runId] = { text, data?, status: 'streaming' | 'done' | 'failed', gapped?, error? }
 ```
 
 ## Angular (17+)
