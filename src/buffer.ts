@@ -13,15 +13,22 @@ export interface Citation {
 /** How a tool call ended. `pending` is a call that has not reported back yet. */
 export type ToolStatus = 'ok' | 'error' | 'pending';
 
+/** What a provider-side search reported: its queries and the sources it returned. */
+export interface SearchResult {
+  queries: string[];
+  citations: Citation[];
+}
+
 /**
  * One entry in a run's transcript — the same shape `getPromptRun` returns as
  * `transcript`, so a chat client renders live and refetched runs with one
  * component.
  *
- * Two fields the API populates are always empty here, because the stream does
- * not carry them: `citations` (per-block metadata the provider attaches to an
- * assistant message, not to a text delta) and `queries` (a tool_start names the
- * tool and nothing else). Fetch the run when you need either.
+ * One field the API populates is always empty here, because the stream cannot
+ * carry it: a **text** block's `citations`, which the provider attaches to the
+ * finished message rather than to the deltas it was streamed as. Fetch the run
+ * when you need those. A tool's own `queries` and `citations` do arrive live,
+ * on the frame that resolves it.
  */
 export type TranscriptItem =
   | { type: 'text'; content: string; citations: Citation[] }
@@ -35,7 +42,14 @@ export type TranscriptItem =
  */
 type BufferedItem =
   | { type: 'text'; content: string }
-  | { type: 'tool'; ref: string; name: string; status: ToolStatus }
+  | {
+      type: 'tool';
+      ref: string;
+      name: string;
+      status: ToolStatus;
+      queries: string[];
+      citations: Citation[];
+    }
   | { type: 'data'; tool: string; payload: unknown };
 
 /**
@@ -74,8 +88,8 @@ type BufferedItem =
  */
 export class RunBuffer {
   private readonly segments = new Map<number, Segment>();
-  // Statuses whose chip has not arrived yet — see endTool.
-  private readonly earlyEnds = new Map<string, ToolStatus>();
+  // Resolutions whose chip has not arrived yet — see endTool.
+  private readonly earlyEnds = new Map<string, { status: ToolStatus } & SearchResult>();
 
   /** Feed a token delta to its segment; the result says what became of it. */
   append(segment: number, seq: number, text: string): 'appended' | 'gap' | 'dropped' {
@@ -201,7 +215,14 @@ export class RunBuffer {
     if (early !== undefined) {
       this.earlyEnds.delete(ref);
     }
-    target?.items.push({ type: 'tool', ref, name: tool, status: early ?? 'pending' });
+    target?.items.push({
+      type: 'tool',
+      ref,
+      name: tool,
+      status: early?.status ?? 'pending',
+      queries: early?.queries ?? [],
+      citations: early?.citations ?? [],
+    });
 
     return outcome;
   }
@@ -210,8 +231,12 @@ export class RunBuffer {
    * Resolve a started tool. Out-of-band: no seq, so it never consumes a slot the
    * client would then find missing. Reports whether anything changed — a ref
    * from a segment a reset already discarded resolves nothing, which is correct.
+   *
+   * `found` is what a provider-side search reported, empty for every other tool.
+   * It arrives here rather than on the start because the end is when the provider
+   * knows it.
    */
-  endTool(ref: string, status: ToolStatus): boolean {
+  endTool(ref: string, status: ToolStatus, found: SearchResult): boolean {
     for (const segment of this.ordered()) {
       for (const item of segment.items) {
         // First still-pending match: refs collide only when the provider sends
@@ -219,16 +244,18 @@ export class RunBuffer {
         // reading of a status that cannot say which one it meant.
         if (item.type === 'tool' && item.ref === ref && item.status === 'pending') {
           item.status = status;
+          item.queries = found.queries;
+          item.citations = dedupe(found.citations);
 
           return true;
         }
       }
     }
 
-    // No chip yet: hold the status for the start still in flight. Bounded by the
+    // No chip yet: hold the resolution for the start still in flight. Bounded by the
     // tools one run can have open, and dropped wholesale by a reset, so a status
     // from an abandoned attempt never lands on the retry's chip.
-    this.earlyEnds.set(ref, status);
+    this.earlyEnds.set(ref, { status, queries: found.queries, citations: dedupe(found.citations) });
 
     return false;
   }
@@ -352,10 +379,33 @@ function publish(item: BufferedItem): TranscriptItem {
     case 'text':
       return { type: 'text', content: item.content, citations: [] };
     case 'tool':
-      return { type: 'tool', name: item.name, status: item.status, queries: [], citations: [] };
+      return {
+        type: 'tool',
+        name: item.name,
+        status: item.status,
+        queries: item.queries,
+        citations: item.citations,
+      };
     case 'data':
       return { type: 'data', tool: item.tool, payload: item.payload };
   }
+}
+
+/**
+ * First occurrence per URL, so merged results keep the order the model searched
+ * in. Mirrors the backend's own dedupe: a provider can return the same source
+ * more than once across a search's result blocks, and the two views of one run
+ * have to collapse them the same way.
+ */
+function dedupe(citations: Citation[]): Citation[] {
+  const byUrl = new Map<string, Citation>();
+  for (const citation of citations) {
+    if (!byUrl.has(citation.url)) {
+      byUrl.set(citation.url, citation);
+    }
+  }
+
+  return [...byUrl.values()];
 }
 
 interface Segment {

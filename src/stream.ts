@@ -1,4 +1,4 @@
-import { RunBuffer, type DataItem, type ToolStatus, type TranscriptItem } from './buffer';
+import { RunBuffer, type Citation, type DataItem, type ToolStatus, type TranscriptItem } from './buffer';
 import { SseParser } from './sse';
 
 export type { Citation, DataItem, ToolStatus, TranscriptItem } from './buffer';
@@ -155,6 +155,8 @@ interface WireEvent {
   payload?: unknown;
   ref?: string;
   status?: ToolStatus;
+  queries?: string[];
+  citations?: Citation[];
 }
 
 type Listener<E extends keyof StreamEvents> = (event: StreamEvents[E]) => void;
@@ -467,8 +469,13 @@ export class PromptJugglerStream {
         // No segment, no seq: a status update found by ref, which is what lets
         // the backend send it for an async call it resolved on its own. A ref
         // whose segment a reset already discarded resolves nothing.
+        //
+        // queries and citations arrive here rather than on the start because the
+        // end is when a provider-side search knows them. Absent for every other
+        // tool, including every tool_end the backend sends.
         const buffer = this.buffer(runId);
-        if (buffer.endTool(wire.ref ?? '', wire.status ?? 'ok')) {
+        const found = { queries: wire.queries ?? [], citations: wire.citations ?? [] };
+        if (buffer.endTool(wire.ref ?? '', wire.status ?? 'ok', found)) {
           this.emitTranscript(runId, channel, buffer);
         }
         break;

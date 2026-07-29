@@ -544,6 +544,71 @@ describe('PromptJugglerStream', () => {
     ]);
   });
 
+  test('a search reports its queries and sources on the chip that resolves', async () => {
+    stream = connect(url);
+    const transcripts = record<TranscriptEvent>();
+    stream.on('transcript', transcripts.push);
+    stream.connect();
+
+    const connection = await server.connection(1);
+    connection.send(
+      'tool_start',
+      '{"kind":"tool_start","runId":"r1","channel":"default","segment":0,"seq":1,"ref":"ws","tool":"web_search"}',
+    );
+    // The same source twice, which a provider can return across result blocks: the
+    // backend's projection collapses them by URL, so the fold has to as well or the
+    // live chip lists one more source than the refetched one.
+    connection.send(
+      'tool_end',
+      '{"kind":"tool_end","runId":"r1","channel":"default","ref":"ws","tool":"web_search",' +
+        '"status":"ok","queries":["danube length"],"citations":[' +
+        '{"title":"Danube","url":"https://example.org/danube"},' +
+        '{"title":"Danube (again)","url":"https://example.org/danube"}]}',
+    );
+
+    await expect
+      .poll(() => transcripts.events[transcripts.events.length - 1]?.transcript)
+      .toEqual([
+        {
+          type: 'tool',
+          name: 'web_search',
+          status: 'ok',
+          queries: ['danube length'],
+          citations: [{ title: 'Danube', url: 'https://example.org/danube' }],
+        },
+      ]);
+  });
+
+  test('a search answered before its chip was written keeps what it found', async () => {
+    stream = connect(url);
+    const transcripts = record<TranscriptEvent>();
+    stream.on('transcript', transcripts.push);
+    stream.connect();
+
+    const connection = await server.connection(1);
+    connection.send(
+      'tool_end',
+      '{"kind":"tool_end","runId":"r1","channel":"default","ref":"ws","tool":"web_search",' +
+        '"status":"ok","queries":["danube length"],' +
+        '"citations":[{"title":"Danube","url":"https://example.org/danube"}]}',
+    );
+    connection.send(
+      'tool_start',
+      '{"kind":"tool_start","runId":"r1","channel":"default","segment":0,"seq":1,"ref":"ws","tool":"web_search"}',
+    );
+
+    const event = await transcripts.next();
+    expect(event.transcript).toEqual([
+      {
+        type: 'tool',
+        name: 'web_search',
+        status: 'ok',
+        queries: ['danube length'],
+        citations: [{ title: 'Danube', url: 'https://example.org/danube' }],
+      },
+    ]);
+  });
+
   test('a tool_end that overtakes the opening reset still resolves the chip', async () => {
     stream = connect(url);
     const transcripts = record<TranscriptEvent>();
