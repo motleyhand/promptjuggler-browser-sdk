@@ -1,5 +1,6 @@
 export { PromptJugglerStream } from './stream';
 export type {
+  Citation,
   DataEvent,
   DataItem,
   DoneEvent,
@@ -11,4 +12,7 @@ export type {
   StreamTokenGrant,
   TextEvent,
   TokenEvent,
+  ToolStatus,
+  TranscriptEvent,
+  TranscriptItem,
 } from './stream';

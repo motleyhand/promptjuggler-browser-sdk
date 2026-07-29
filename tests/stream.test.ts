@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
-import type { DataEvent, DoneEvent, TextEvent } from '../src/stream';
+import type { DataEvent, DoneEvent, TextEvent, TranscriptEvent } from '../src/stream';
 import { PromptJugglerStream, withChannels } from '../src/stream';
 import { connect, record, SseServer } from './helpers';
 
@@ -518,6 +518,166 @@ describe('PromptJugglerStream', () => {
     // A late emit proves the settled data was incomplete: flagged, not applied.
     expect(await gaps.next()).toMatchObject({ runId: 'r1' });
     expect(datas.events).toHaveLength(0);
+  });
+
+  test('a tool_end arriving before its tool_start still resolves the chip', async () => {
+    stream = connect(url);
+    const transcripts = record<TranscriptEvent>();
+    stream.on('transcript', transcripts.push);
+    stream.connect();
+
+    const connection = await server.connection(1);
+    // The runner's frames ride a buffered hand-off while the backend publishes
+    // directly, so a fast async tool can be answered before its chip was written.
+    connection.send(
+      'tool_end',
+      '{"kind":"tool_end","runId":"r1","channel":"default","ref":"abc","tool":"research","status":"ok"}',
+    );
+    connection.send(
+      'tool_start',
+      '{"kind":"tool_start","runId":"r1","channel":"default","segment":0,"seq":1,"ref":"abc","tool":"research"}',
+    );
+
+    const event = await transcripts.next();
+    expect(event.transcript).toEqual([
+      { type: 'tool', name: 'research', status: 'ok', queries: [], citations: [] },
+    ]);
+  });
+
+  test('a tool_end that overtakes the opening reset still resolves the chip', async () => {
+    stream = connect(url);
+    const transcripts = record<TranscriptEvent>();
+    stream.on('transcript', transcripts.push);
+    stream.connect();
+
+    const connection = await server.connection(1);
+    // The whole runner stream can lag far enough that the backend's resolution
+    // beats even the reset every attempt opens with. That reset abandons nothing,
+    // so it must not take the held status with it.
+    connection.send(
+      'tool_end',
+      '{"kind":"tool_end","runId":"r1","channel":"default","ref":"abc","tool":"research","status":"error"}',
+    );
+    connection.send('reset', '{"kind":"reset","runId":"r1","channel":"default","segment":0,"seq":0}');
+    connection.send(
+      'tool_start',
+      '{"kind":"tool_start","runId":"r1","channel":"default","segment":0,"seq":1,"ref":"abc","tool":"research"}',
+    );
+
+    const event = await transcripts.next();
+    expect(event.transcript).toEqual([
+      { type: 'tool', name: 'research', status: 'error', queries: [], citations: [] },
+    ]);
+  });
+
+  test('a continuation reset keeps a held status for an earlier segment', async () => {
+    stream = connect(url);
+    const transcripts = record<TranscriptEvent>();
+    stream.on('transcript', transcripts.push);
+    stream.connect();
+
+    const connection = await server.connection(1);
+    connection.send(
+      'token',
+      '{"kind":"token","runId":"r1","channel":"default","segment":0,"seq":1,"text":"Checking"}',
+    );
+    connection.send(
+      'tool_end',
+      '{"kind":"tool_end","runId":"r1","channel":"default","ref":"abc","tool":"research","status":"ok"}',
+    );
+    // The continuation is dispatched to another worker, so its reset can overtake
+    // the frames still draining from the first. It opens a higher segment and
+    // discards nothing, so it abandons no call and invalidates no held status.
+    connection.send('reset', '{"kind":"reset","runId":"r1","channel":"default","segment":1,"seq":0}');
+    connection.send(
+      'tool_start',
+      '{"kind":"tool_start","runId":"r1","channel":"default","segment":0,"seq":2,"ref":"abc","tool":"research"}',
+    );
+
+    await expect
+      .poll(() => transcripts.events[transcripts.events.length - 1]?.transcript)
+      .toEqual([
+        { type: 'text', content: 'Checking', citations: [] },
+        { type: 'tool', name: 'research', status: 'ok', queries: [], citations: [] },
+      ]);
+  });
+
+  test('a retry discards a held status instead of settling the new chip with it', async () => {
+    stream = connect(url);
+    const transcripts = record<TranscriptEvent>();
+    stream.on('transcript', transcripts.push);
+    stream.connect();
+
+    const connection = await server.connection(1);
+    connection.send(
+      'token',
+      '{"kind":"token","runId":"r1","channel":"default","segment":0,"seq":1,"text":"working"}',
+    );
+    connection.send(
+      'tool_end',
+      '{"kind":"tool_end","runId":"r1","channel":"default","ref":"abc","tool":"research","status":"error"}',
+    );
+    // The attempt is abandoned; its unmatched status goes with it.
+    connection.send('reset', '{"kind":"reset","runId":"r1","channel":"default","segment":0,"seq":0}');
+    connection.send(
+      'tool_start',
+      '{"kind":"tool_start","runId":"r1","channel":"default","segment":0,"seq":1,"ref":"abc","tool":"research"}',
+    );
+
+    await expect
+      .poll(() => transcripts.events[transcripts.events.length - 1]?.transcript)
+      .toEqual([{ type: 'tool', name: 'research', status: 'pending', queries: [], citations: [] }]);
+  });
+
+  test('a run known only by an out-of-band tool_end settles gapped', async () => {
+    stream = connect(url);
+    const done = record<DoneEvent>();
+    stream.on('done', done.push);
+    stream.connect();
+
+    const connection = await server.connection(1);
+    // Both frames are published directly by the backend, so both can beat the
+    // runner's buffered hand-off. The tool_end creates a buffer but claims no
+    // segment: nothing of this run was actually seen, and a consumer settling
+    // it as whole would render a successful run with no content at all.
+    connection.send(
+      'tool_end',
+      '{"kind":"tool_end","runId":"r1","channel":"default","ref":"abc","tool":"research","status":"ok"}',
+    );
+    connection.send('done', '{"kind":"done","runId":"r1","channel":"default"}');
+
+    expect(await done.next()).toMatchObject({ runId: 'r1', gapped: true });
+  });
+
+  test('a tool_end straggler after done flags the run', async () => {
+    stream = connect(url);
+    const transcripts = record<{ runId: string }>();
+    const gaps = record<{ runId: string }>();
+    const done = record<DoneEvent>();
+    stream.on('transcript', transcripts.push);
+    stream.on('gap', gaps.push);
+    stream.on('done', done.push);
+    stream.connect();
+
+    const connection = await server.connection(1);
+    connection.send(
+      'tool_start',
+      '{"kind":"tool_start","runId":"r1","channel":"default","segment":0,"seq":1,"ref":"abc","tool":"research"}',
+    );
+    connection.send('done', '{"kind":"done","runId":"r1","channel":"default"}');
+    expect(await done.next()).toMatchObject({ runId: 'r1', gapped: false });
+    const settled = transcripts.events.length;
+
+    // The backend publishes tool_end directly while the runner's frames ride a
+    // lagging publisher, so it can trail done. The buffer is already gone, so
+    // the chip stays pending here while the fetched run reports ok — which
+    // makes the straggler proof the settled view was incomplete.
+    connection.send(
+      'tool_end',
+      '{"kind":"tool_end","runId":"r1","channel":"default","ref":"abc","tool":"research","status":"ok"}',
+    );
+    expect(await gaps.next()).toMatchObject({ runId: 'r1' });
+    expect(transcripts.events).toHaveLength(settled);
   });
 
   test('terminal events drop the run buffer', async () => {

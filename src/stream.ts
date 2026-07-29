@@ -1,7 +1,7 @@
-import { RunBuffer, type DataItem } from './buffer';
+import { RunBuffer, type DataItem, type ToolStatus, type TranscriptItem } from './buffer';
 import { SseParser } from './sse';
 
-export type { DataItem } from './buffer';
+export type { Citation, DataItem, ToolStatus, TranscriptItem } from './buffer';
 
 /** What `getToken` resolves to — hand back `createStreamToken`'s response verbatim. */
 export interface StreamTokenGrant {
@@ -80,6 +80,20 @@ export interface DataEvent {
   data: DataItem[];
 }
 
+/**
+ * The run so far as a renderable sequence: assistant text, the tools it used
+ * and their status, and emit payloads in position. Maintained like `text` —
+ * each event carries the whole list, with retried segments dropped — and the
+ * same shape `getPromptRun` returns, so one component renders both.
+ */
+export interface TranscriptEvent {
+  runId: string;
+  channel: string;
+  transcript: TranscriptItem[];
+  /** True when events were (or may have been) lost: treat the list as a possibly-incomplete prefix. */
+  gapped: boolean;
+}
+
 export interface DoneEvent {
   runId: string;
   channel: string;
@@ -105,6 +119,8 @@ export interface StreamEvents {
   reset: ResetEvent;
   /** The run's emit-tool payloads, maintained — subscribe to render structured data. */
   data: DataEvent;
+  /** The run's full transcript after each change — subscribe to render a chat. */
+  transcript: TranscriptEvent;
   /**
    * One run's text is incomplete; frozen at a true prefix. May also follow a
    * terminal event, when a straggling token proves the verdict it carried was
@@ -137,6 +153,8 @@ interface WireEvent {
   message?: string;
   tool?: string;
   payload?: unknown;
+  ref?: string;
+  status?: ToolStatus;
 }
 
 type Listener<E extends keyof StreamEvents> = (event: StreamEvents[E]) => void;
@@ -205,6 +223,11 @@ export class PromptJugglerStream {
   /** The maintained full text for a run, if any has streamed. */
   text(runId: string): string | undefined {
     return this.buffers.get(runId)?.text();
+  }
+
+  /** The maintained transcript for a run, if any has streamed. */
+  transcript(runId: string): TranscriptItem[] | undefined {
+    return this.buffers.get(runId)?.transcript();
   }
 
   private emit<E extends keyof StreamEvents>(event: E, payload: StreamEvents[E]): void {
@@ -357,12 +380,21 @@ export class PromptJugglerStream {
     if (runId === undefined) {
       return;
     }
-    if ((kind === 'token' || kind === 'reset' || kind === 'data') && this.verdicts.has(runId)) {
-      // The runner's tokens ride a lagging async publisher while the backend
-      // publishes the terminal frame directly, so stragglers can trail done.
+    if (
+      (kind === 'token' ||
+        kind === 'reset' ||
+        kind === 'data' ||
+        kind === 'tool_start' ||
+        kind === 'tool_end') &&
+      this.verdicts.has(runId)
+    ) {
+      // The runner's frames ride a lagging async publisher while the backend
+      // publishes the terminal one directly, so stragglers can trail done.
       // The run stays terminal — no buffer revival, no status flip — but a
-      // straggler is proof the text was incomplete when the verdict settled:
-      // upgrade it and say so, once.
+      // straggler is proof the view was incomplete when the verdict settled:
+      // upgrade it and say so, once. A late tool_end counts: the buffer is
+      // already forgotten, so the chip it would have resolved stays pending
+      // while the fetched transcript reports ok or error.
       if (!(this.verdicts.get(runId) ?? false)) {
         this.verdicts.set(runId, true);
         this.emit('gap', { runId, channel: wire.channel ?? '', segment: wire.segment ?? 0 });
@@ -383,12 +415,10 @@ export class PromptJugglerStream {
         // have the seq to judge it by. Only the maintained view withholds
         // post-gap fragments, so its text stays a true prefix of the run.
         this.emit('token', { runId, channel, segment, seq, text: wire.text ?? '' });
-        if (outcome === 'gap') {
-          this.emit('gap', { runId, channel, segment });
+        if (outcome === 'appended') {
+          this.emitText(runId, channel, buffer);
         }
-        if (outcome !== 'dropped') {
-          this.emit('text', { runId, channel, text: buffer.text(), gapped: buffer.gapped() });
-        }
+        this.settle(runId, channel, segment, buffer, outcome);
         break;
       }
       case 'reset': {
@@ -404,7 +434,8 @@ export class PromptJugglerStream {
           this.emit('gap', { runId, channel, segment });
         }
         if (changed) {
-          this.emit('text', { runId, channel, text: buffer.text(), gapped: buffer.gapped() });
+          this.emitText(runId, channel, buffer);
+          this.emitTranscript(runId, channel, buffer);
         }
         if (buffer.data().length !== dataBefore) {
           // The reset discarded payloads from the re-generated segment; the
@@ -419,15 +450,26 @@ export class PromptJugglerStream {
         const buffer = this.buffer(runId);
         const before = buffer.data().length;
         const outcome = buffer.addData(segment, seq, { tool: wire.tool ?? '', payload: wire.payload });
-        if (outcome === 'gap') {
-          // A data frame rides the token sequence, so a hole here means a token
-          // was lost before it: flag the run and let text subscribers see the
-          // now-frozen prefix, exactly as a token gap would.
-          this.emit('gap', { runId, channel, segment });
-          this.emit('text', { runId, channel, text: buffer.text(), gapped: buffer.gapped() });
-        }
+        this.settle(runId, channel, segment, buffer, outcome);
         if (buffer.data().length !== before) {
           this.emit('data', { runId, channel, data: buffer.data() });
+        }
+        break;
+      }
+      case 'tool_start': {
+        const segment = wire.segment ?? 0;
+        const buffer = this.buffer(runId);
+        const outcome = buffer.startTool(segment, wire.seq ?? 0, wire.ref ?? '', wire.tool ?? '');
+        this.settle(runId, channel, segment, buffer, outcome);
+        break;
+      }
+      case 'tool_end': {
+        // No segment, no seq: a status update found by ref, which is what lets
+        // the backend send it for an async call it resolved on its own. A ref
+        // whose segment a reset already discarded resolves nothing.
+        const buffer = this.buffer(runId);
+        if (buffer.endTool(wire.ref ?? '', wire.status ?? 'ok')) {
+          this.emitTranscript(runId, channel, buffer);
         }
         break;
       }
@@ -450,6 +492,43 @@ export class PromptJugglerStream {
     }
   }
 
+  /**
+   * The tail every in-band frame shares — token, data and tool_start ride the
+   * same segment sequence, so they lose content the same way and republish the
+   * same views. A hole flags the run and freezes the text at a true prefix,
+   * which text subscribers need even though only a token ever grows it; that
+   * growth is the caller's to announce. A frame dropped past an unresolved hole
+   * changes nothing worth saying.
+   */
+  private settle(
+    runId: string,
+    channel: string,
+    segment: number,
+    buffer: RunBuffer,
+    outcome: 'appended' | 'gap' | 'dropped',
+  ): void {
+    if (outcome === 'gap') {
+      this.emit('gap', { runId, channel, segment });
+      this.emitText(runId, channel, buffer);
+    }
+    if (outcome !== 'dropped') {
+      this.emitTranscript(runId, channel, buffer);
+    }
+  }
+
+  private emitText(runId: string, channel: string, buffer: RunBuffer): void {
+    this.emit('text', { runId, channel, text: buffer.text(), gapped: buffer.gapped() });
+  }
+
+  private emitTranscript(runId: string, channel: string, buffer: RunBuffer): void {
+    this.emit('transcript', {
+      runId,
+      channel,
+      transcript: buffer.transcript(),
+      gapped: buffer.gapped(),
+    });
+  }
+
   private buffer(runId: string): RunBuffer {
     let buffer = this.buffers.get(runId);
     if (!buffer) {
@@ -464,12 +543,14 @@ export class PromptJugglerStream {
   private verdict(runId: string): boolean {
     let verdict = this.verdicts.get(runId);
     if (verdict === undefined) {
-      // Every attempt opens with a reset and a reset creates the buffer, so a
-      // subscribed client holds one for every run that executed — even a
-      // zero-text run. Holding none at terminal time means the whole stream
-      // was missed (a reconnect window, or a late connect): the largest gap
-      // there is, not a clean run.
-      verdict = this.buffers.get(runId)?.gapped() ?? true;
+      // Every attempt opens with a reset and every sequenced frame claims a
+      // segment, so a subscribed client has observed something for every run
+      // that executed — even a zero-text one. Having observed nothing at
+      // terminal time means the whole stream was missed (a reconnect window, a
+      // late connect, or only an out-of-band tool_end, which creates a buffer
+      // but claims no segment): the largest gap there is, not a clean run.
+      const buffer = this.buffers.get(runId);
+      verdict = buffer?.observed() === true ? buffer.gapped() : true;
       this.verdicts.set(runId, verdict);
     }
 

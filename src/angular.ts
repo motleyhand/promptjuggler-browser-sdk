@@ -6,7 +6,15 @@ import {
   type Injector,
   type Signal,
 } from '@angular/core';
-import { applyData, applyDone, applyFailure, applyGap, applyStale, applyText } from './runstate';
+import {
+  applyData,
+  applyDone,
+  applyFailure,
+  applyGap,
+  applyStale,
+  applyText,
+  applyTranscript,
+} from './runstate';
 import type { RunState, RunStates } from './runstate';
 import { PromptJugglerStream, type PromptJugglerStreamOptions } from './stream';
 
@@ -65,6 +73,9 @@ export function injectPromptJugglerStream(
           }),
           stream.on('data', (event) => {
             runs.update((previous) => applyData(previous, event));
+          }),
+          stream.on('transcript', (event) => {
+            runs.update((previous) => applyTranscript(previous, event));
           }),
           stream.on('stale', () => {
             runs.update(applyStale);
