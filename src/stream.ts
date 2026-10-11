@@ -248,7 +248,7 @@ export class PromptJugglerStream {
         return;
       }
       if (immediately) {
-        // The server handed us off (deploy, broker restart): a fresh pod is
+        // The server handed us off (deploy, Valkey outage): a fresh pod is
         // already waiting and the cursor resumes exactly — no reason to wait.
         this.attempts = 0;
         continue;
