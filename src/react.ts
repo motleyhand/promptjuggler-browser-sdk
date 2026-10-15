@@ -49,6 +49,7 @@ export function usePromptJugglerStream(
       getToken: () => latest.current.getToken(),
       streamUrl: latest.current.streamUrl,
       channels: latest.current.channels,
+      replay: latest.current.replay,
       reconnectDelayMs: latest.current.reconnectDelayMs,
     });
 

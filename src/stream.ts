@@ -29,6 +29,13 @@ export interface PromptJugglerStreamOptions {
    * nodes are user-facing by assigning channels; omit to receive every lane.
    */
   channels?: string[];
+  /**
+   * Replay what the thread's log still holds (about 15 minutes) instead of
+   * starting at the live tip, for a client that connects after triggering the
+   * run. Runs that finished in that window replay too, each ending in its
+   * terminal event.
+   */
+  replay?: boolean;
   /** Reconnect backoff bounds in milliseconds. */
   reconnectDelayMs?: { min?: number; max?: number };
 }
@@ -168,7 +175,8 @@ type Listener<E extends keyof StreamEvents> = (event: StreamEvents[E]) => void;
  * (automatically — with backoff after failures, immediately when the server
  * hands the connection off during a deploy), and when the server cannot
  * resume without loss it says `stale`. Connect before triggering runs: a
- * fresh subscription starts at the live tip, not in the past.
+ * fresh subscription starts at the live tip, not in the past. A client that
+ * can only connect after should set `replay`.
  */
 export class PromptJugglerStream {
   private readonly options: PromptJugglerStreamOptions;
@@ -192,6 +200,8 @@ export class PromptJugglerStream {
 
   constructor(options: PromptJugglerStreamOptions) {
     this.options = options;
+    // The origin cursor: every attempt replays until a frame brings a real one.
+    this.lastEventId = options.replay ? '0' : undefined;
   }
 
   on<E extends keyof StreamEvents>(event: E, listener: Listener<E>): () => void {

@@ -277,4 +277,19 @@ describe('usePromptJugglerStream', () => {
 
     unmount();
   });
+
+  test('forwards replay to the stream', async () => {
+    const { unmount } = renderHook(() =>
+      usePromptJugglerStream({
+        getToken: () => Promise.resolve({ token: 'test-token', url }),
+        reconnectDelayMs: { min: 10, max: 50 },
+        replay: true,
+      }),
+    );
+
+    const connection = await server.connection(1);
+    expect(connection.request.headers['last-event-id']).toBe('0');
+
+    unmount();
+  });
 });

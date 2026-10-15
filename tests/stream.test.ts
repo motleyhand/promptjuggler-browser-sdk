@@ -311,9 +311,38 @@ describe('PromptJugglerStream', () => {
 
     const second = await server.connection(2);
     expect(second.request.headers.authorization).toBe('Bearer token-2');
-    // No replay in v1 — the server only logs this, but the protocol sends it.
     expect(second.request.headers['last-event-id']).toBe('7');
     expect(mints).toBe(2);
+  });
+
+  test('replay sends the origin cursor until a frame brings a real one', async () => {
+    stream = connect(url, { replay: true });
+    stream.connect();
+
+    const first = await server.connection(1);
+    expect(first.request.headers['last-event-id']).toBe('0');
+    first.end();
+
+    // Dropped before any frame: the client still holds nothing, so it replays again.
+    const second = await server.connection(2);
+    expect(second.request.headers['last-event-id']).toBe('0');
+    second.send(
+      'token',
+      '{"kind":"token","runId":"r1","channel":"default","segment":0,"seq":1,"text":"Hi"}',
+      7,
+    );
+    second.reconnect();
+
+    const third = await server.connection(3);
+    expect(third.request.headers['last-event-id']).toBe('7');
+  });
+
+  test('without replay the first connection sends no cursor', async () => {
+    stream = connect(url);
+    stream.connect();
+
+    const first = await server.connection(1);
+    expect(first.request.headers['last-event-id']).toBeUndefined();
   });
 
   test('retries with backoff after an HTTP rejection', async () => {

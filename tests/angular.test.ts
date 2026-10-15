@@ -96,4 +96,18 @@ describe('injectPromptJugglerStream', () => {
     expect(runs()).toEqual({});
     expect(server.connections).toHaveLength(1); // and no reconnect either
   });
+
+  test('forwards replay to the stream', async () => {
+    TestBed.runInInjectionContext(() =>
+      injectPromptJugglerStream(() => ({
+        getToken: () => Promise.resolve({ token: 'test-token', url }),
+        reconnectDelayMs: { min: 10, max: 50 },
+        replay: true,
+      })),
+    );
+    TestBed.tick();
+
+    const connection = await server.connection(1);
+    expect(connection.request.headers['last-event-id']).toBe('0');
+  });
 });

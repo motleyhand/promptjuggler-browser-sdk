@@ -11,9 +11,11 @@ this package is safe to ship to an end user — it never sees your API key.
    and nothing else.
 2. Your **frontend** hands that response to this SDK and renders events.
 3. Connect **before** triggering runs: a fresh subscription starts at the
-   live tip. Reconnects resume exactly where they left off; when the server
-   cannot resume without loss it says `stale`, and terminal events carry a
-   `gapped` flag — `true` means fetch the run for the authoritative result.
+   live tip. If your frontend learns the thread from the run it triggered,
+   set `replay: true` instead (see below). Reconnects resume exactly where
+   they left off; when the server cannot resume without loss it says `stale`,
+   and terminal events carry a `gapped` flag — `true` means fetch the run for
+   the authoritative result.
 
 ```ts
 import { PromptJugglerStream } from '@promptjuggler/browser';
@@ -55,6 +57,13 @@ you have already settled. The React hook handles this for you.
 
 Workflows stream every prompt node; follow specific conversation lanes with
 `channels: ['support']` (the channel each node declares in the workflow editor).
+
+## Connecting after the run started
+
+`replay: true` makes the first connection replay what the thread's log still
+holds (about 15 minutes), so a run already under way streams from its first
+token. Runs that finished in that window replay too, each ending in its `done`
+or `failure`, so render only the runs your UI shows.
 
 ## React
 
