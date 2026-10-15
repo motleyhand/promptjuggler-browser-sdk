@@ -239,10 +239,6 @@ export class RunBuffer {
   endTool(ref: string, status: ToolStatus, found: SearchResult): boolean {
     for (const segment of this.ordered()) {
       for (const item of segment.items) {
-        // First still-pending match: refs collide only when the correlator fell
-        // back to the tool name for a call without an id, and the earliest
-        // unresolved call is the honest reading of a status that cannot say which
-        // one it meant.
         if (item.type === 'tool' && item.ref === ref && item.status === 'pending') {
           item.status = status;
           item.queries = found.queries;
